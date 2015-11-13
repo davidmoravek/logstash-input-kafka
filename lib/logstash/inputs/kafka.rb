@@ -1,5 +1,6 @@
 require 'logstash/namespace'
 require 'logstash/inputs/base'
+require 'concurrent'
 require 'jruby-kafka'
 
 # This input will read events from a Kafka topic. It uses the high level consumer API provided
@@ -17,6 +18,9 @@ require 'jruby-kafka'
 # Kafka consumer configuration: http://kafka.apache.org/documentation.html#consumerconfigs
 #
 class LogStash::Inputs::Kafka < LogStash::Inputs::Base
+
+  java_import 'java.util.concurrent.Executors'
+
   config_name 'kafka'
 
   default :codec, 'json'
@@ -92,6 +96,8 @@ class LogStash::Inputs::Kafka < LogStash::Inputs::Base
   config :key_decoder_class, :validate => :string, :default => 'kafka.serializer.DefaultDecoder'
   # The frequency in ms that the consumer offsets are committed to zookeeper.
   config :auto_commit_interval, :validate => :string, :default => '1000'
+  # Number of threads to decode messages read by consumers.
+  config :decoder_threads, :validate => :number, :default => 1
 
 
   public
@@ -136,13 +142,26 @@ class LogStash::Inputs::Kafka < LogStash::Inputs::Base
     @logger.info('Running kafka', :group_id => @group_id, :topic_id => @topic_id, :zk_connect => @zk_connect)
     begin
       @consumer_group.run(@consumer_threads,@kafka_client_queue)
+      running = true
       begin
-        while true
-          event = @kafka_client_queue.pop
-          queue_event(event, logstash_queue)
+        executor = Executors.newFixedThreadPool(@decoder_threads)
+        latch = Concurrent::CountDownLatch.new(@decoder_threads)
+        @decoder_threads.times do
+          executor.submit do
+            while running
+              if !@kafka_client_queue.empty?
+                event = @kafka_client_queue.pop
+                queue_event(event, logstash_queue)
+              end
+            end
+            latch.count_down
+          end
         end
+        latch.wait
+        executor.shutdown
       rescue LogStash::ShutdownSignal
         @logger.info('Kafka got shutdown signal')
+        running = false
         @consumer_group.shutdown
       end
       until @kafka_client_queue.empty?
@@ -154,6 +173,7 @@ class LogStash::Inputs::Kafka < LogStash::Inputs::Base
                    :exception => e)
       if @consumer_group.running?
         @consumer_group.shutdown
+        running = false
       end
       sleep(Float(@consumer_restart_sleep_ms) * 1 / 1000)
       retry
