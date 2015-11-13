@@ -1,5 +1,6 @@
 require 'logstash/namespace'
 require 'logstash/inputs/base'
+require 'concurrent'
 require 'jruby-kafka'
 require 'stud/interval'
 
@@ -18,6 +19,9 @@ require 'stud/interval'
 # Kafka consumer configuration: http://kafka.apache.org/documentation.html#consumerconfigs
 #
 class LogStash::Inputs::Kafka < LogStash::Inputs::Base
+
+  java_import 'java.util.concurrent.Executors'
+
   config_name 'kafka'
 
   default :codec, 'json'
@@ -91,6 +95,8 @@ class LogStash::Inputs::Kafka < LogStash::Inputs::Base
   config :decoder_class, :validate => :string, :default => 'kafka.serializer.DefaultDecoder'
   # The serializer class for keys (defaults to the same default as for messages)
   config :key_decoder_class, :validate => :string, :default => 'kafka.serializer.DefaultDecoder'
+  # Number of threads to decode messages read by consumers.
+  config :decoder_threads, :validate => :number, :default => 1
 
 
   public
@@ -135,12 +141,21 @@ class LogStash::Inputs::Kafka < LogStash::Inputs::Base
     begin
       @consumer_group.run(@consumer_threads,@kafka_client_queue)
 
-      while !stop?
-        if !@kafka_client_queue.empty?
-          event = @kafka_client_queue.pop
-          queue_event(event, logstash_queue)
+      executor = Executors.newFixedThreadPool(@decoder_threads)
+      latch = Concurrent::CountDownLatch.new(@decoder_threads)
+      @decoder_threads.times do
+        executor.submit do
+          while !stop?
+            if !@kafka_client_queue.empty?
+              event = @kafka_client_queue.pop
+              queue_event(event, logstash_queue)
+            end
+          end
+          latch.count_down
         end
       end
+      latch.wait
+      executor.shutdown
 
       until @kafka_client_queue.empty?
         queue_event(@kafka_client_queue.pop,logstash_queue)
