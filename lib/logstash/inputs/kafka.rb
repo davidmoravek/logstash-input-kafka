@@ -2,6 +2,7 @@ require 'logstash/namespace'
 require 'logstash/inputs/base'
 require 'jruby-kafka'
 require 'stud/interval'
+require 'concurrent'
 
 # This input will read events from a Kafka topic. It uses the high level consumer API provided
 # by Kafka to read messages from the broker. It also maintains the state of what has been
@@ -102,9 +103,10 @@ class LogStash::Inputs::Kafka < LogStash::Inputs::Base
   def register
     LogStash::Logger.setup_log4j(@logger)
     options = {
-        :zk_connect => @zk_connect,
+        :zookeeper_connect => @zk_connect,
         :group_id => @group_id,
-        :topic_id => @topic_id,
+        :topic => @topic_id,
+	:num_streams => @consumer_threads,
         :auto_offset_reset => @auto_offset_reset,
         :auto_commit_interval => @auto_commit_interval_ms,
         :rebalance_max_retries => @rebalance_max_retries,
@@ -116,8 +118,8 @@ class LogStash::Inputs::Kafka < LogStash::Inputs::Base
         :fetch_message_max_bytes => @fetch_message_max_bytes,
         :allow_topics => @white_list,
         :filter_topics => @black_list,
-        :value_decoder_class => @decoder_class,
-        :key_decoder_class => @key_decoder_class
+        :msg_decoder => @decoder_class,
+        :key_decoder => @key_decoder_class
     }
     if @reset_beginning
       options[:reset_beginning] = 'from-beginning'
@@ -129,48 +131,49 @@ class LogStash::Inputs::Kafka < LogStash::Inputs::Base
       raise LogStash::ConfigurationError, 'Invalid combination of topic_id, white_list or black_list. Use only one.'
     end
     @kafka_client_queue = SizedQueue.new(@queue_size)
-    @consumer_group = create_consumer_group(options)
+    @consumer = create_consumer(options)
     @logger.info('Registering kafka', :group_id => @group_id, :topic_id => @topic_id, :zk_connect => @zk_connect)
   end # def register
 
   public
   def run(logstash_queue)
     # noinspection JRubyStringImportInspection
-    java_import 'kafka.common.ConsumerRebalanceFailedException'
+    #java_import 'kafka.common.ConsumerRebalanceFailedException'
     @logger.info('Running kafka', :group_id => @group_id, :topic_id => @topic_id, :zk_connect => @zk_connect)
     begin
-      @consumer_group.run(@consumer_threads,@kafka_client_queue)
 
-      while !stop?
-        event = @kafka_client_queue.pop
-        if event == KAFKA_SHUTDOWN_EVENT
-          break
-        end
-        queue_event(event, logstash_queue)
+      latch = Concurrent::CountDownLatch.new(@consumer_threads)
+
+      @consumer.message_streams.each_with_index do |stream, thread_num|
+        Thread.new { consumer_worker stream, thread_num, latch, logstash_queue }
       end
 
-      until @kafka_client_queue.empty?
-        queue_event(@kafka_client_queue.pop,logstash_queue)
-      end
-
+      latch.wait
       @logger.info('Done running kafka input')
     rescue => e
       @logger.warn('kafka client threw exception, restarting',
                    :exception => e)
-      Stud.stoppable_sleep(Float(@consumer_restart_sleep_ms) * 1 / 1000) { stop? }
-      retry if !stop?
+      #Stud.stoppable_sleep(Float(@consumer_restart_sleep_ms) * 1 / 1000) { stop? }
+      #retry if !stop?
     end
   end # def run
 
   public
   def stop
-    @kafka_client_queue.push(KAFKA_SHUTDOWN_EVENT)
-    @consumer_group.shutdown if @consumer_group.running?
+    @consumer.shutdown
   end
 
-  private
-  def create_consumer_group(options)
-    Kafka::Group.new(options)
+  def create_consumer(options)
+    Kafka::Consumer.new(options)
+  end
+
+  def consumer_worker(stream, thread_num, latch, logstash_queue)
+    it = stream.iterator
+    while it.hasNext do
+            queue_event(it.next, logstash_queue)
+    end
+    @logger.info("Shutting down thread num #{thread_num}")
+    latch.count_down
   end
 
   private
